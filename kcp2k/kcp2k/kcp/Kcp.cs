@@ -1,6 +1,7 @@
 // Kcp based on https://github.com/skywind3000/kcp
 // Kept as close to original as possible.
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 
 namespace kcp2k
@@ -66,8 +67,8 @@ namespace kcp2k
         internal int fastresend;
         internal int fastlimit;
         internal bool nocwnd;        // congestion control, negated. heavily restricts send/recv window sizes.
-        internal readonly Queue<Segment> snd_queue = new Queue<Segment>(16); // send queue
-        internal readonly Queue<Segment> rcv_queue = new Queue<Segment>(16); // receive queue
+        internal readonly ConcurrentQueue<Segment> snd_queue = new ConcurrentQueue<Segment>(new List<Segment>(16)); // send queue
+        internal readonly ConcurrentQueue<Segment> rcv_queue = new ConcurrentQueue<Segment>(new List<Segment>(16)); // receive queue
         // snd_buffer needs index removals.
         // C# LinkedList allocates for each entry, so let's keep List for now.
         internal readonly List<Segment> snd_buf = new List<Segment>(16);   // send buffer
@@ -182,24 +183,26 @@ namespace kcp2k
             {
                 // unlike original kcp, we dequeue instead of just getting the
                 // entry. this is fine because we remove it in ANY case.
-                Segment seg = rcv_queue.Dequeue();
+                if (rcv_queue.TryDequeue(out Segment seg))
+                {
 
-                // copy segment data into our buffer
-                Buffer.BlockCopy(seg.data.GetBuffer(), 0, buffer, offset, (int)seg.data.Position);
-                offset += (int)seg.data.Position;
+                    // copy segment data into our buffer
+                    Buffer.BlockCopy(seg.data.GetBuffer(), 0, buffer, offset, (int)seg.data.Position);
+                    offset += (int)seg.data.Position;
 
-                len += (int)seg.data.Position;
-                uint fragment = seg.frg;
+                    len += (int)seg.data.Position;
+                    uint fragment = seg.frg;
 
-                // note: ispeek is not supported in order to simplify this loop
+                    // note: ispeek is not supported in order to simplify this loop
 
-                // unlike original kcp, we don't need to remove seg from queue
-                // because we already dequeued it.
-                // simply delete it
-                SegmentDelete(seg);
+                    // unlike original kcp, we don't need to remove seg from queue
+                    // because we already dequeued it.
+                    // simply delete it
+                    SegmentDelete(seg);
 
-                if (fragment == 0)
-                    break;
+                    if (fragment == 0)
+                        break;
+                }
             }
 
             // move available data from rcv_buf -> rcv_queue
@@ -246,27 +249,29 @@ namespace kcp2k
             if (rcv_queue.Count == 0) return -1;
 
             // peek the first segment
-            Segment seq = rcv_queue.Peek();
-
-            // seg.frg is 0 if the message requires no fragmentation.
-            // in that case, the segment's size is the final message size.
-            if (seq.frg == 0) return (int)seq.data.Position;
-
-            // check if all fragment parts were received yet.
-            // seg.frg is the n-th fragment, but in reverse.
-            // this way the first received segment tells us how many fragments there are for the message.
-            // for example, if a message contains 3 segments:
-            //   first segment:  .frg is 2 (index in reverse)
-            //   second segment: .frg is 1 (index in reverse)
-            //   third segment:  .frg is 0 (index in reverse)
-            if (rcv_queue.Count < seq.frg + 1) return -1;
-
-            // recv_queue contains all the fragments necessary to reconstruct the message.
-            // sum all fragment's sizes to get the full message size.
-            foreach (Segment seg in rcv_queue)
+            if (rcv_queue.TryPeek(out Segment seq))
             {
-                length += (int)seg.data.Position;
-                if (seg.frg == 0) break;
+
+                // seg.frg is 0 if the message requires no fragmentation.
+                // in that case, the segment's size is the final message size.
+                if (seq.frg == 0) return (int)seq.data.Position;
+
+                // check if all fragment parts were received yet.
+                // seg.frg is the n-th fragment, but in reverse.
+                // this way the first received segment tells us how many fragments there are for the message.
+                // for example, if a message contains 3 segments:
+                //   first segment:  .frg is 2 (index in reverse)
+                //   second segment: .frg is 1 (index in reverse)
+                //   third segment:  .frg is 0 (index in reverse)
+                if (rcv_queue.Count < seq.frg + 1) return -1;
+
+                // recv_queue contains all the fragments necessary to reconstruct the message.
+                // sum all fragment's sizes to get the full message size.
+                foreach (Segment seg in rcv_queue)
+                {
+                    length += (int)seg.data.Position;
+                    if (seg.frg == 0) break;
+                }
             }
 
             return length;
@@ -309,18 +314,6 @@ namespace kcp2k
             {
                 int size = len > (int)mss ? (int)mss : len;
                 Segment seg = SegmentNew();
-
-                while (true)
-                {
-                    if (seg == null)
-                    {
-                        seg = SegmentNew();
-                    }
-                    else
-                    {
-                        break;
-                    }
-                }
 
                 if (len > 0)
                 {
@@ -830,22 +823,22 @@ namespace kcp2k
             {
                 if (snd_queue.Count == 0) break;
 
-                Segment newseg = snd_queue.Dequeue();
+                if (snd_queue.TryDequeue(out Segment newseg))
+                {
 
-                if (newseg == null) continue;
-
-                newseg.conv = conv;
-                newseg.cmd = CMD_PUSH;
-                newseg.wnd = seg.wnd;
-                newseg.ts = current;
-                newseg.sn = snd_nxt;
-                snd_nxt += 1; // increase sequence number for next segment
-                newseg.una = rcv_nxt;
-                newseg.resendts = current;
-                newseg.rto = rx_rto;
-                newseg.fastack = 0;
-                newseg.xmit = 0;
-                snd_buf.Add(newseg);
+                    newseg.conv = conv;
+                    newseg.cmd = CMD_PUSH;
+                    newseg.wnd = seg.wnd;
+                    newseg.ts = current;
+                    newseg.sn = snd_nxt;
+                    snd_nxt += 1; // increase sequence number for next segment
+                    newseg.una = rcv_nxt;
+                    newseg.resendts = current;
+                    newseg.rto = rx_rto;
+                    newseg.fastack = 0;
+                    newseg.xmit = 0;
+                    snd_buf.Add(newseg);
+                }
             }
 
             // calculate resent

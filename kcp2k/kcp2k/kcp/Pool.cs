@@ -1,5 +1,6 @@
 ﻿// Pool to avoid allocations (from libuv2k & Mirror)
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 
 namespace kcp2k
@@ -7,7 +8,7 @@ namespace kcp2k
     public class Pool<T>
     {
         // Mirror is single threaded, no need for concurrent collections
-        readonly Stack<T> objects = new Stack<T>();
+        readonly ConcurrentStack<T> objects = new ConcurrentStack<T>();
 
         // some types might need additional parameters in their constructor, so
         // we use a Func<T> generator
@@ -28,7 +29,14 @@ namespace kcp2k
         }
 
         // take an element from the pool, or create a new one if empty
-        public T Take() => objects.Count > 0 ? objects.Pop() : objectGenerator();
+        public T Take()
+        {
+            while (objects.Count > 0)
+            {
+                if (objects.TryPop(out T result)) return result;
+            }
+            return objectGenerator();
+        }
 
         // return an element to the pool
         public void Return(T item)
